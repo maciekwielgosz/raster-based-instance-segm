@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+.RData
+.Rhistory
+.Rproj.user/
+
+# Generated or source geospatial datasets do not belong in this code repository.
+*.gpkg
+*.tif
+*.tiff
+*.vrt
+*.aux.xml
