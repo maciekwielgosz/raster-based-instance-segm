@@ -54,11 +54,64 @@ from shapely.ops import unary_union
 from tqdm import tqdm
 
 
-PROJECT_CRS = "EPSG:2180"
-BUFFER_METRES = 25.0
-MIN_HEIGHT = 2.0
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUN_DIR = SCRIPT_DIR.parent
+
+
+# =============================================================================
+# USER-TUNABLE CONFIGURATION
+# =============================================================================
+# The defaults below reproduce the original R workflow. Keep them unchanged
+# when comparing Python results with pcopw_chunks_500m_Segmentacja.R.
+
+# Input and output layout
+DEFAULT_INPUT_DIR = RUN_DIR / "data_input"
+DEFAULT_OUTPUT_DIR = RUN_DIR / "data_output"
+SEGMENTATION_SUBDIRECTORY = "Segmentation3"
+CHM_TILE_GLOB = "chm_*.tif"
+CHM_TILE_PREFIX = "chm_"
+CHM_BAND_INDEX = 1  # Raster bands are numbered starting at 1.
+VRT_FILENAME = "00_CHM_Full.vrt"
+TREETOP_OUTPUT_PREFIX = "ttops_"
+CROWN_OUTPUT_PREFIX = "crowns_"
+OUTPUT_EXTENSION = ".gpkg"
+OUTPUT_DRIVER = "GPKG"
+OUTPUT_ENGINE = "pyogrio"
+OVERWRITE_EXISTING_OUTPUTS = False
+
+# Spatial and canopy-height settings
+PROJECT_CRS = "EPSG:2180"
+BUFFER_METRES = 25.0  # Context around each core tile for reducing edge effects.
+MIN_HEIGHT = 2.0  # Minimum CHM height used for both detection and crowns.
+MEDIAN_FILTER_SIZE = 3  # Pixel window; use a positive odd integer.
+
+# Variable local-maximum-filter window diameter f_ws(height), in metres:
+#   height < LMF_LOW_HEIGHT_LIMIT:  LMF_LOW_WINDOW_SIZE
+#   height < LMF_HIGH_HEIGHT_LIMIT: height * LMF_MID_SLOPE + LMF_MID_INTERCEPT
+#   otherwise:                      height * LMF_HIGH_SLOPE + LMF_HIGH_INTERCEPT
+LMF_LOW_HEIGHT_LIMIT = 10.0
+LMF_HIGH_HEIGHT_LIMIT = 25.0
+LMF_LOW_WINDOW_SIZE = 2.0
+LMF_MID_SLOPE = 0.1
+LMF_MID_INTERCEPT = 0.3
+LMF_HIGH_SLOPE = 0.15
+LMF_HIGH_INTERCEPT = 1.0
+
+# Marker-controlled watershed and raster-to-polygon settings
+WATERSHED_CONNECTIVITY = 8  # Allowed values: 4 or 8; ForestTools uses 8.
+POLYGON_CONNECTIVITY = 4  # Allowed values: 4 or 8; ForestTools output uses 4.
+
+# Näslund DBH estimate and output precision. A and B are empirical coefficients.
+DBH_PARAMETER_A = 10.0
+DBH_PARAMETER_B = 0.6
+DBH_REFERENCE_HEIGHT = 1.3  # Breast-height reference in metres.
+DBH_DECIMAL_PLACES = 2
+# =============================================================================
+# END USER-TUNABLE CONFIGURATION
+# =============================================================================
+
+# Numerical implementation detail; this is not a model hyperparameter.
+FOOTPRINT_DISTANCE_TOLERANCE = 1e-12
 
 
 @dataclass(frozen=True)
@@ -76,14 +129,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=RUN_DIR / "data_input",
-        help="Directory containing chm_*.tif and 00_CHM_Full.vrt.",
+        default=DEFAULT_INPUT_DIR,
+        help=f"Directory containing {CHM_TILE_GLOB} and {VRT_FILENAME}.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=RUN_DIR / "data_output",
-        help="Base output directory; files are written below Segmentation3.",
+        default=DEFAULT_OUTPUT_DIR,
+        help=(
+            "Base output directory; files are written below "
+            f"{SEGMENTATION_SUBDIRECTORY}."
+        ),
     )
     parser.add_argument(
         "--tile",
@@ -95,14 +151,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
+        default=OVERWRITE_EXISTING_OUTPUTS,
         help="Replace existing paired GeoPackage outputs.",
     )
     return parser.parse_args()
 
 
-def dbh_naslund(height: np.ndarray, a: float = 10.0, b: float = 0.6) -> np.ndarray:
+def dbh_naslund(
+    height: np.ndarray,
+    a: float = DBH_PARAMETER_A,
+    b: float = DBH_PARAMETER_B,
+) -> np.ndarray:
     """Estimate diameter at breast height using the formula from the R script."""
-    hm = np.maximum(height - 1.3, 0.0)
+    hm = np.maximum(height - DBH_REFERENCE_HEIGHT, 0.0)
     coefficient_a = -hm * b
     coefficient_c = -hm * a
     discriminant = coefficient_a**2 - 4.0 * coefficient_c
@@ -112,17 +173,20 @@ def dbh_naslund(height: np.ndarray, a: float = 10.0, b: float = 0.6) -> np.ndarr
 def moving_window_size(height: np.ndarray | float) -> np.ndarray | float:
     """Variable LMF window diameter, in metres, matching ``f_ws`` in R."""
     return np.where(
-        np.asarray(height) < 10.0,
-        2.0,
-        np.where(np.asarray(height) < 25.0, np.asarray(height) * 0.1 + 0.3,
-                 np.asarray(height) * 0.15 + 1.0),
+        np.asarray(height) < LMF_LOW_HEIGHT_LIMIT,
+        LMF_LOW_WINDOW_SIZE,
+        np.where(
+            np.asarray(height) < LMF_HIGH_HEIGHT_LIMIT,
+            np.asarray(height) * LMF_MID_SLOPE + LMF_MID_INTERCEPT,
+            np.asarray(height) * LMF_HIGH_SLOPE + LMF_HIGH_INTERCEPT,
+        ),
     )
 
 
 def read_buffered_chm(
     chm_file: Path, vrt_path: Path
 ) -> tuple[np.ndarray, rasterio.Affine, rasterio.coords.BoundingBox]:
-    """Read the tile extent plus the same 25 m VRT buffer used by Terra."""
+    """Read the tile extent plus the configured VRT buffer."""
     with rasterio.open(chm_file) as core_source:
         core_bounds = core_source.bounds
 
@@ -136,20 +200,20 @@ def read_buffered_chm(
     with rasterio.open(vrt_path) as vrt_source:
         window = from_bounds(*buffered_bounds, transform=vrt_source.transform)
         window = window.round_offsets().round_lengths()
-        chm = vrt_source.read(1, window=window, masked=True)
+        chm = vrt_source.read(CHM_BAND_INDEX, window=window, masked=True)
         transform = vrt_source.window_transform(window)
 
     return chm.filled(np.nan).astype(np.float32), transform, core_bounds
 
 
 def smooth_chm(chm: np.ndarray) -> np.ndarray:
-    """Apply Terra-compatible 3 x 3 median smoothing while ignoring NoData."""
+    """Apply Terra-compatible median smoothing while ignoring NoData."""
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="All-NaN slice encountered")
         return generic_filter(
             chm,
             np.nanmedian,
-            size=3,
+            size=MEDIAN_FILTER_SIZE,
             output=np.float64,
             mode="constant",
             cval=np.nan,
@@ -164,7 +228,7 @@ def circular_footprint(radius: float, x_resolution: float, y_resolution: float) 
         -col_radius : col_radius + 1,
     ]
     squared_distance = (cols * x_resolution) ** 2 + (rows * y_resolution) ** 2
-    return squared_distance <= radius**2 + 1e-12
+    return squared_distance <= radius**2 + FOOTPRINT_DISTANCE_TOLERANCE
 
 
 def locate_trees_lmf(
@@ -216,7 +280,7 @@ def locate_trees_lmf(
         ]
         inside = (
             (cols * x_resolution) ** 2 + (rows * y_resolution) ** 2
-            <= radius**2 + 1e-12
+            <= radius**2 + FOOTPRINT_DISTANCE_TOLERANCE
         )
         neighbourhood = chm[row_start:row_stop, col_start:col_stop]
         neighbourhood_values = neighbourhood[inside]
@@ -262,7 +326,7 @@ def empty_treetops() -> gpd.GeoDataFrame:
 
 
 def cimg_watershed(marker_raster: np.ndarray, priority: np.ndarray) -> np.ndarray:
-    """Port CImg's high-connectivity priority watershed used by ``imager``.
+    """Port CImg's priority watershed used by ``imager``.
 
     ``imager::watershed`` passes its third argument (named ``fill_lines`` in
     R) directly to CImg as ``is_high_connectivity``. ForestTools uses the
@@ -273,16 +337,24 @@ def cimg_watershed(marker_raster: np.ndarray, priority: np.ndarray) -> np.ndarra
     seed_locations: list[tuple[int, int]] = []
     priority_queue: list[list[float | int]] = []
     row_count, col_count = output.shape
-    neighbours = (
+    four_neighbours = (
         (-1, 0),
         (1, 0),
         (0, -1),
         (0, 1),
+    )
+    diagonal_neighbours = (
         (-1, -1),
         (1, -1),
         (-1, 1),
         (1, 1),
     )
+    if WATERSHED_CONNECTIVITY == 8:
+        neighbours = four_neighbours + diagonal_neighbours
+    elif WATERSHED_CONNECTIVITY == 4:
+        neighbours = four_neighbours
+    else:
+        raise ValueError("WATERSHED_CONNECTIVITY must be 4 or 8")
 
     def queue_insert(value: float, row: int, col: int, seed_number: int) -> None:
         if queued_labels[row, col] != 0:
@@ -415,7 +487,7 @@ def segment_crowns(
         labels,
         mask=labels > 0,
         transform=transform,
-        connectivity=4,
+        connectivity=POLYGON_CONNECTIVITY,
     ):
         tree_id = int(value)
         pieces.setdefault(tree_id, []).append(shape(geometry_mapping))
@@ -456,21 +528,25 @@ def write_outputs_atomically(
 ) -> None:
     """Write both GeoPackages before replacing any existing final output."""
     token = uuid.uuid4().hex
-    temporary_treetops = treetop_path.with_name(f".{treetop_path.stem}.{token}.gpkg")
-    temporary_crowns = crown_path.with_name(f".{crown_path.stem}.{token}.gpkg")
+    temporary_treetops = treetop_path.with_name(
+        f".{treetop_path.stem}.{token}{OUTPUT_EXTENSION}"
+    )
+    temporary_crowns = crown_path.with_name(
+        f".{crown_path.stem}.{token}{OUTPUT_EXTENSION}"
+    )
     try:
         treetops.to_file(
             temporary_treetops,
             layer=treetop_path.stem,
-            driver="GPKG",
-            engine="pyogrio",
+            driver=OUTPUT_DRIVER,
+            engine=OUTPUT_ENGINE,
             index=False,
         )
         crowns.to_file(
             temporary_crowns,
             layer=crown_path.stem,
-            driver="GPKG",
-            engine="pyogrio",
+            driver=OUTPUT_DRIVER,
+            engine=OUTPUT_ENGINE,
             index=False,
         )
         os.replace(temporary_treetops, treetop_path)
@@ -493,9 +569,13 @@ def process_tile(
     segmentation_dir: Path,
     overwrite: bool,
 ) -> TileResult:
-    tile_id = chm_file.stem.removeprefix("chm_")
-    crown_path = segmentation_dir / f"crowns_{tile_id}.gpkg"
-    treetop_path = segmentation_dir / f"ttops_{tile_id}.gpkg"
+    tile_id = chm_file.stem.removeprefix(CHM_TILE_PREFIX)
+    crown_path = segmentation_dir / (
+        f"{CROWN_OUTPUT_PREFIX}{tile_id}{OUTPUT_EXTENSION}"
+    )
+    treetop_path = segmentation_dir / (
+        f"{TREETOP_OUTPUT_PREFIX}{tile_id}{OUTPUT_EXTENSION}"
+    )
 
     crown_exists = crown_path.exists()
     treetop_exists = treetop_path.exists()
@@ -519,7 +599,11 @@ def process_tile(
         chm, transform, core_bounds = read_buffered_chm(chm_file, vrt_path)
         finite = chm[np.isfinite(chm)]
         if finite.size == 0 or float(np.max(finite)) < MIN_HEIGHT:
-            return TileResult(tile_id, "empty", detail="no CHM values at least 2 m")
+            return TileResult(
+                tile_id,
+                "empty",
+                detail=f"no CHM values at least {MIN_HEIGHT:g} m",
+            )
 
         smoothed = smooth_chm(chm)
         all_treetops, markers = locate_trees_lmf(smoothed, transform)
@@ -532,7 +616,7 @@ def process_tile(
             return TileResult(tile_id, "empty", detail="no tree tops inside core tile")
 
         final_treetops["dbh"] = np.round(
-            dbh_naslund(final_treetops["Z"].to_numpy()), 2
+            dbh_naslund(final_treetops["Z"].to_numpy()), DBH_DECIMAL_PLACES
         )
         core_tree_ids = set(final_treetops["treeID"].astype(int))
         final_crowns = segment_crowns(smoothed, transform, markers, core_tree_ids)
@@ -557,18 +641,20 @@ def main() -> int:
     args = parse_args()
     start = time.monotonic()
     input_dir = args.input_dir.resolve()
-    segmentation_dir = args.output_dir.resolve() / "Segmentation3"
-    vrt_path = input_dir / "00_CHM_Full.vrt"
+    segmentation_dir = args.output_dir.resolve() / SEGMENTATION_SUBDIRECTORY
+    vrt_path = input_dir / VRT_FILENAME
     segmentation_dir.mkdir(parents=True, exist_ok=True)
 
-    chm_files = sorted(input_dir.glob("chm_*.tif"))
+    chm_files = sorted(input_dir.glob(CHM_TILE_GLOB))
     if args.tile:
         requested = set(args.tile)
         chm_files = [
             path for path in chm_files
-            if path.stem.removeprefix("chm_") in requested
+            if path.stem.removeprefix(CHM_TILE_PREFIX) in requested
         ]
-        found = {path.stem.removeprefix("chm_") for path in chm_files}
+        found = {
+            path.stem.removeprefix(CHM_TILE_PREFIX) for path in chm_files
+        }
         missing = requested - found
         if missing:
             print(f"Błąd: nie znaleziono kafli: {', '.join(sorted(missing))}", file=sys.stderr)
