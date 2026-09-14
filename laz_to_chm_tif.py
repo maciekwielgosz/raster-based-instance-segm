@@ -5,12 +5,15 @@ The TreeScan point clouds use local X/Y/Z coordinates and have no CRS in their
 LAS headers. Plot centres are read from ``plot_summary.xlsx`` and local X/Y
 coordinates are translated around those EPSG:2180 centres.
 
-Canopy height is derived from annotated tree points (``treeID > 0``). Each
+Canopy height is derived from annotated tree points (``point_source_id > 0``).
+This standard LAS field contains the stable tree identifier used by
+``individual_tree_summary.csv``; the extra ``treeID`` field is only an
+internal re-numbering and is deliberately not used for metadata joins. Each
 tree's lowest Z is treated as its zero-height reference, and the robust
-``height_m`` values supplied in ``individual_tree_summary.csv`` are used to
-reject high-Z annotation outliers. The maximum normalized height in each
-0.5 m cell becomes the CHM value. Scanned cells without tree points are zero;
-cells without any scan coverage are NoData.
+``height_m`` values supplied in the CSV are used to reject high-Z annotation
+outliers. The maximum normalized height in each 0.5 m cell becomes the CHM
+value. Scanned cells without tree points are zero; cells without any scan
+coverage are NoData.
 
 GeoTIFF storage settings are copied from a reference ``chm_*.tif`` in
 ``run_r/data_input``. Existing outputs are skipped unless ``--overwrite`` is
@@ -83,7 +86,10 @@ REFERENCE_TIF_GLOB = "chm_*.tif"
 
 OUTPUT_PREFIX = "chm_"
 OUTPUT_SUFFIX = ".tif"
-TREE_ID_DIMENSION = "treeID"
+# ``point_source_id`` is the original tree ID and matches the tree-summary
+# CSV. The TreeScan-specific ``treeID`` extra dimension is a plot-local
+# sequential re-numbering whose values can refer to different CSV rows.
+TREE_ID_DIMENSION = "point_source_id"
 
 PIXEL_SIZE_METRES = 0.5
 PLOT_HALF_SIZE_METRES = 15.0
@@ -428,7 +434,7 @@ def dimension_names(reader: laspy.LasReader) -> set[str]:
 
 
 def find_tree_bases(laz_path: Path) -> tuple[np.ndarray, int]:
-    """First pass: find the minimum Z for each positive TreeScan tree ID."""
+    """First pass: find minimum Z for each positive canonical tree ID."""
     bases = np.full(1, np.inf, dtype=np.float64)
     with laspy.open(laz_path) as reader:
         if TREE_ID_DIMENSION not in dimension_names(reader):

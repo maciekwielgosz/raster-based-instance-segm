@@ -69,8 +69,11 @@ repository.
 `run_r/data_input_from_laz`. It reads plot centres from `plot_summary.xlsx`,
 uses the supplied per-tree heights to reject Z outliers, and copies its CRS,
 data type, NoData value, compression, and band layout from a reference CHM in
-`run_r/data_input`. A positive tree ID missing from the supplied tree summary
-is reported and omitted rather than rasterized without an outlier limit.
+`run_r/data_input`. The standard LAS `point_source_id` is used as the stable
+tree identifier because it matches `individual_tree_summary.csv`; the extra
+TreeScan `treeID` field is only an internal re-numbering. A positive tree ID
+missing from the supplied tree summary is reported and omitted rather than
+rasterized without an outlier limit.
 
 The additional Python dependency is `laspy` with its `lazrs-python` backend.
 From the `run_r` directory, convert all plots with:
@@ -94,3 +97,31 @@ The launcher passes `--independent-tiles`, because TreeScan plots are separate
 GeoPackage outputs are skipped; pass `--overwrite` to the launcher only when
 replacement is intentional. Results are written below
 `run_r/data_output_from_laz/Segmentation3`.
+
+## Create crown ground truth from TreeScan labels
+
+`laz_to_crown_gt.py` projects the labeled LAZ instances onto the exact grid of
+each matching `chm_*.tif` and writes one crown contour per tree to a GeoPackage.
+By default, each `gt_<LAZ-stem>.gpkg` is written beside its corresponding CHM
+in `run_r/data_input_from_laz`, in layer `crowns_gt` and the CHM's CRS.
+
+The exporter applies the same per-tree height outlier limits as the CHM
+converter. It fills internal mask holes, removes disconnected label noise, and
+stores both raw and cleaned cell counts. Crowns clipped by a plot edge remain
+in the file but have `evaluation_eligible=0`; this lets assessment code exclude
+them without losing the annotation. Use `--complete-only` if they should not be
+written at all.
+
+From the `run_r` directory, create all ground-truth files with:
+
+```bash
+python code/laz_to_crown_gt.py
+```
+
+Use `--file <name>.laz` to process one plot, `--dry-run` to validate all input
+pairs, `--workers 3` for conservative plot-level parallel processing, and
+`--overwrite` to explicitly replace existing GT GeoPackages. Each worker reads
+a large point cloud, so increase this value cautiously. The resulting `treeID`
+values match `individual_tree_summary.csv`, and the polygons can be used for
+instance-level IoU/Dice, boundary-distance, detection precision/recall, or
+quality-assessment metrics after matching predicted and reference instances.
