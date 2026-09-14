@@ -13,6 +13,10 @@ Run from the repository root with:
 
 Existing paired crown/tree-top outputs are skipped by default.  Use
 ``--overwrite`` only when replacing those outputs is intentional.
+
+For standalone rasters that are not parts of a continuous VRT mosaic, use
+``--independent-tiles``. Each raster is then padded with NoData for the
+configured buffer instead of reading neighboring pixels from a VRT.
 """
 
 from __future__ import annotations
@@ -130,7 +134,10 @@ def parse_args() -> argparse.Namespace:
         "--input-dir",
         type=Path,
         default=DEFAULT_INPUT_DIR,
-        help=f"Directory containing {CHM_TILE_GLOB} and {VRT_FILENAME}.",
+        help=(
+            f"Directory containing {CHM_TILE_GLOB}; also requires "
+            f"{VRT_FILENAME} unless --independent-tiles is used."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -153,6 +160,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=OVERWRITE_EXISTING_OUTPUTS,
         help="Replace existing paired GeoPackage outputs.",
+    )
+    parser.add_argument(
+        "--independent-tiles",
+        action="store_true",
+        help=(
+            "Process every TIFF independently, padding its buffer with NoData "
+            "instead of reading 00_CHM_Full.vrt."
+        ),
     )
     return parser.parse_args()
 
@@ -184,9 +199,9 @@ def moving_window_size(height: np.ndarray | float) -> np.ndarray | float:
 
 
 def read_buffered_chm(
-    chm_file: Path, vrt_path: Path
+    chm_file: Path, vrt_path: Path | None
 ) -> tuple[np.ndarray, rasterio.Affine, rasterio.coords.BoundingBox]:
-    """Read the tile extent plus the configured VRT buffer."""
+    """Read the configured buffer from a VRT or pad one independent tile."""
     with rasterio.open(chm_file) as core_source:
         core_bounds = core_source.bounds
 
@@ -197,11 +212,17 @@ def read_buffered_chm(
         core_bounds.top + BUFFER_METRES,
     )
 
-    with rasterio.open(vrt_path) as vrt_source:
-        window = from_bounds(*buffered_bounds, transform=vrt_source.transform)
+    raster_path = vrt_path if vrt_path is not None else chm_file
+    with rasterio.open(raster_path) as raster_source:
+        window = from_bounds(*buffered_bounds, transform=raster_source.transform)
         window = window.round_offsets().round_lengths()
-        chm = vrt_source.read(CHM_BAND_INDEX, window=window, masked=True)
-        transform = vrt_source.window_transform(window)
+        chm = raster_source.read(
+            CHM_BAND_INDEX,
+            window=window,
+            masked=True,
+            boundless=vrt_path is None,
+        )
+        transform = raster_source.window_transform(window)
 
     return chm.filled(np.nan).astype(np.float32), transform, core_bounds
 
@@ -565,7 +586,7 @@ def existing_feature_count(path: Path) -> int:
 
 def process_tile(
     chm_file: Path,
-    vrt_path: Path,
+    vrt_path: Path | None,
     segmentation_dir: Path,
     overwrite: bool,
 ) -> TileResult:
@@ -642,7 +663,7 @@ def main() -> int:
     start = time.monotonic()
     input_dir = args.input_dir.resolve()
     segmentation_dir = args.output_dir.resolve() / SEGMENTATION_SUBDIRECTORY
-    vrt_path = input_dir / VRT_FILENAME
+    vrt_path = None if args.independent_tiles else input_dir / VRT_FILENAME
     segmentation_dir.mkdir(parents=True, exist_ok=True)
 
     chm_files = sorted(input_dir.glob(CHM_TILE_GLOB))
@@ -663,7 +684,7 @@ def main() -> int:
     if not chm_files:
         print(f"Błąd: Brak plików CHM. Sprawdź folder: {input_dir}", file=sys.stderr)
         return 2
-    if not vrt_path.is_file():
+    if vrt_path is not None and not vrt_path.is_file():
         print(f"Błąd: Brak pliku VRT: {vrt_path}", file=sys.stderr)
         return 2
 
