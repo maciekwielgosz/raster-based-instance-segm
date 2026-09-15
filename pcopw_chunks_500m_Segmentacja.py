@@ -169,7 +169,140 @@ def parse_args() -> argparse.Namespace:
             "instead of reading 00_CHM_Full.vrt."
         ),
     )
+    parser.add_argument(
+        "--min-height",
+        type=float,
+        default=MIN_HEIGHT,
+        help=f"Minimum CHM height for detection and crowns; default {MIN_HEIGHT:g} m.",
+    )
+    parser.add_argument(
+        "--median-filter-size",
+        type=int,
+        default=MEDIAN_FILTER_SIZE,
+        help=f"Positive odd median-filter window size; default {MEDIAN_FILTER_SIZE}.",
+    )
+    parser.add_argument(
+        "--lmf-low-height-limit",
+        type=float,
+        default=LMF_LOW_HEIGHT_LIMIT,
+        help=f"First LMF height breakpoint; default {LMF_LOW_HEIGHT_LIMIT:g} m.",
+    )
+    parser.add_argument(
+        "--lmf-high-height-limit",
+        type=float,
+        default=LMF_HIGH_HEIGHT_LIMIT,
+        help=f"Second LMF height breakpoint; default {LMF_HIGH_HEIGHT_LIMIT:g} m.",
+    )
+    parser.add_argument(
+        "--lmf-low-window-size",
+        type=float,
+        default=LMF_LOW_WINDOW_SIZE,
+        help=f"LMF window diameter below the first breakpoint; default {LMF_LOW_WINDOW_SIZE:g} m.",
+    )
+    parser.add_argument(
+        "--lmf-mid-slope",
+        type=float,
+        default=LMF_MID_SLOPE,
+        help=f"Middle LMF line slope; default {LMF_MID_SLOPE:g}.",
+    )
+    parser.add_argument(
+        "--lmf-mid-intercept",
+        type=float,
+        default=LMF_MID_INTERCEPT,
+        help=f"Middle LMF line intercept; default {LMF_MID_INTERCEPT:g} m.",
+    )
+    parser.add_argument(
+        "--lmf-high-slope",
+        type=float,
+        default=LMF_HIGH_SLOPE,
+        help=f"Upper LMF line slope; default {LMF_HIGH_SLOPE:g}.",
+    )
+    parser.add_argument(
+        "--lmf-high-intercept",
+        type=float,
+        default=LMF_HIGH_INTERCEPT,
+        help=f"Upper LMF line intercept; default {LMF_HIGH_INTERCEPT:g} m.",
+    )
+    parser.add_argument(
+        "--watershed-connectivity",
+        type=int,
+        choices=(4, 8),
+        default=WATERSHED_CONNECTIVITY,
+        help=f"Watershed neighbourhood connectivity; default {WATERSHED_CONNECTIVITY}.",
+    )
+    parser.add_argument(
+        "--polygon-connectivity",
+        type=int,
+        choices=(4, 8),
+        default=POLYGON_CONNECTIVITY,
+        help=f"Raster polygonization connectivity; default {POLYGON_CONNECTIVITY}.",
+    )
     return parser.parse_args()
+
+
+def apply_cli_hyperparameters(args: argparse.Namespace) -> None:
+    """Validate and apply optional CLI overrides without changing defaults."""
+    global MIN_HEIGHT
+    global MEDIAN_FILTER_SIZE
+    global LMF_LOW_HEIGHT_LIMIT
+    global LMF_HIGH_HEIGHT_LIMIT
+    global LMF_LOW_WINDOW_SIZE
+    global LMF_MID_SLOPE
+    global LMF_MID_INTERCEPT
+    global LMF_HIGH_SLOPE
+    global LMF_HIGH_INTERCEPT
+    global WATERSHED_CONNECTIVITY
+    global POLYGON_CONNECTIVITY
+
+    numeric_values = {
+        "--min-height": args.min_height,
+        "--lmf-low-height-limit": args.lmf_low_height_limit,
+        "--lmf-high-height-limit": args.lmf_high_height_limit,
+        "--lmf-low-window-size": args.lmf_low_window_size,
+        "--lmf-mid-slope": args.lmf_mid_slope,
+        "--lmf-mid-intercept": args.lmf_mid_intercept,
+        "--lmf-high-slope": args.lmf_high_slope,
+        "--lmf-high-intercept": args.lmf_high_intercept,
+    }
+    non_finite = [name for name, value in numeric_values.items() if not math.isfinite(value)]
+    if non_finite:
+        raise ValueError("Non-finite hyperparameters: " + ", ".join(non_finite))
+    if args.min_height < 0:
+        raise ValueError("--min-height must be non-negative")
+    if args.median_filter_size < 1 or args.median_filter_size % 2 == 0:
+        raise ValueError("--median-filter-size must be a positive odd integer")
+    if args.lmf_low_height_limit < 0:
+        raise ValueError("--lmf-low-height-limit must be non-negative")
+    if args.lmf_high_height_limit <= args.lmf_low_height_limit:
+        raise ValueError(
+            "--lmf-high-height-limit must exceed --lmf-low-height-limit"
+        )
+    if args.lmf_low_window_size <= 0:
+        raise ValueError("--lmf-low-window-size must be positive")
+    middle_windows = (
+        args.lmf_low_height_limit * args.lmf_mid_slope
+        + args.lmf_mid_intercept,
+        args.lmf_high_height_limit * args.lmf_mid_slope
+        + args.lmf_mid_intercept,
+    )
+    upper_window = (
+        args.lmf_high_height_limit * args.lmf_high_slope
+        + args.lmf_high_intercept
+    )
+    if min(*middle_windows, upper_window) <= 0:
+        raise ValueError("The configured LMF window function must stay positive")
+
+    MIN_HEIGHT = args.min_height
+    MEDIAN_FILTER_SIZE = args.median_filter_size
+    LMF_LOW_HEIGHT_LIMIT = args.lmf_low_height_limit
+    LMF_HIGH_HEIGHT_LIMIT = args.lmf_high_height_limit
+    LMF_LOW_WINDOW_SIZE = args.lmf_low_window_size
+    LMF_MID_SLOPE = args.lmf_mid_slope
+    LMF_MID_INTERCEPT = args.lmf_mid_intercept
+    LMF_HIGH_SLOPE = args.lmf_high_slope
+    LMF_HIGH_INTERCEPT = args.lmf_high_intercept
+    WATERSHED_CONNECTIVITY = args.watershed_connectivity
+    POLYGON_CONNECTIVITY = args.polygon_connectivity
 
 
 def dbh_naslund(
@@ -661,6 +794,11 @@ def process_tile(
 def main() -> int:
     args = parse_args()
     start = time.monotonic()
+    try:
+        apply_cli_hyperparameters(args)
+    except ValueError as error:
+        print(f"Błąd parametrów: {error}", file=sys.stderr)
+        return 2
     input_dir = args.input_dir.resolve()
     segmentation_dir = args.output_dir.resolve() / SEGMENTATION_SUBDIRECTORY
     vrt_path = None if args.independent_tiles else input_dir / VRT_FILENAME
@@ -689,6 +827,15 @@ def main() -> int:
         return 2
 
     print(">>> C1. Start Segmentacji (Python)...")
+    print(
+        "Hyperparameters: "
+        f"min_height={MIN_HEIGHT:g}, median_filter={MEDIAN_FILTER_SIZE}, "
+        f"LMF breaks=({LMF_LOW_HEIGHT_LIMIT:g}, {LMF_HIGH_HEIGHT_LIMIT:g}), "
+        f"LMF low={LMF_LOW_WINDOW_SIZE:g}, "
+        f"LMF mid={LMF_MID_SLOPE:g}*h+{LMF_MID_INTERCEPT:g}, "
+        f"LMF high={LMF_HIGH_SLOPE:g}*h+{LMF_HIGH_INTERCEPT:g}, "
+        f"watershed={WATERSHED_CONNECTIVITY}, polygon={POLYGON_CONNECTIVITY}"
+    )
     results = [
         process_tile(path, vrt_path, segmentation_dir, args.overwrite)
         for path in tqdm(chm_files, unit="tile", desc="Segmentacja")

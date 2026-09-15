@@ -125,3 +125,152 @@ a large point cloud, so increase this value cautiously. The resulting `treeID`
 values match `individual_tree_summary.csv`, and the polygons can be used for
 instance-level IoU/Dice, boundary-distance, detection precision/recall, or
 quality-assessment metrics after matching predicted and reference instances.
+
+### Create exclusive topmost-cell ground truth
+
+`laz_to_topmost_crown_gt.py` creates a second GT representation designed to
+match the single-label CHM segmentation domain. For every 0.5 m cell whose CHM
+height is at least 2 m, it assigns the canonical `point_source_id` of the tree
+whose accepted labeled LAZ point has the greatest normalized height in that
+cell. A height tie is resolved deterministically in favour of the smaller tree
+ID. Consequently every canopy cell belongs to exactly one tree and GT crowns
+cannot overlap.
+
+Both outputs are written beside the CHMs without replacing the original
+overlapping `gt_*.gpkg` files:
+
+- `topmost_gt_<LAZ-stem>.tif`: an `int32` label raster, with `-1` for CHM
+  NoData, `0` for background below 2 m, and a positive tree ID for canopy.
+- `topmost_gt_<LAZ-stem>.gpkg`: the same labels converted into non-overlapping
+  polygons in layer `crowns_gt_topmost`.
+
+Create all exclusive GT pairs from the `run_r` directory with:
+
+```bash
+python code/laz_to_topmost_crown_gt.py --workers 3
+```
+
+Use `--file <plot>` for one plot, `--dry-run` to validate the input pairs, and
+`--overwrite` to replace existing topmost raster/vector pairs. The 2 m cutoff
+is `MIN_CANOPY_HEIGHT_METRES` near the top of the script and intentionally
+matches `MIN_HEIGHT` in the segmentation script.
+
+## Evaluate crown instance segmentation
+
+`evaluate_crown_segmentation.py` compares each predicted
+`crowns_<plot>.gpkg` with the matching `gt_<plot>.gpkg`. It uses one-to-one
+polygon matching that maximizes the number of matches above each IoU threshold
+and then their total IoU. The default thresholds are 0.25, 0.50, and 0.75;
+0.50 is the primary threshold used in the per-tile and per-object reports.
+
+By default, GT crowns marked `evaluation_eligible=0` are excluded because they
+are clipped by a plot edge. An unmatched prediction whose area overlaps one of
+those ignored crowns by at least 50% is also ignored instead of being counted
+as a false positive. This avoids penalizing a method for detecting a real tree
+whose reference crown is incomplete.
+
+From the `run_r` directory, evaluate all plots with:
+
+```bash
+python code/evaluate_crown_segmentation.py
+```
+
+Reports are written to `data_output_from_laz/quality_metrics`:
+
+- `overall_metrics.csv`: dataset metrics at every requested IoU threshold.
+- `per_tile_metrics.csv`: metrics for every plot at the primary threshold.
+- `matched_crowns.csv`: matched IDs, IoU, Dice, area error, centroid error,
+  Hausdorff distance, and sampled symmetric boundary distances.
+- `unmatched_objects.csv`: false negatives, false positives, and predictions
+  ignored at incomplete edge crowns.
+- `evaluation_summary.json`: configuration and machine-readable overall
+  results.
+
+Reported detection metrics include precision, recall, and F1. Recognition
+Quality (`RQ`) equals detection F1, Segmentation Quality (`SQ`) is mean IoU of
+true-positive matches, and Panoptic Quality is `PQ = RQ * SQ`. Area precision,
+recall, Dice, and IoU use the summed intersection areas of matched instances.
+Aggregate area, centroid, Hausdorff, and symmetric-boundary errors are included
+for matches at the primary threshold.
+
+Use `--file <plot>` for one plot, `--primary-iou <value>` to change the main
+cutoff, `--iou-thresholds <values...>` to select reported thresholds, and
+`--overwrite` to replace existing reports. Use `--include-incomplete-gt` only
+when clipped edge crowns should deliberately be scored.
+
+To evaluate the exclusive topmost-cell GT instead of the original projected
+GT, select its filename prefix and GeoPackage layer and use a separate report
+directory:
+
+```bash
+python code/evaluate_crown_segmentation.py \
+    --gt-prefix topmost_gt_ \
+    --gt-layer crowns_gt_topmost \
+    --output-dir data_output_from_laz/quality_metrics_topmost
+```
+
+## Optimize segmentation hyperparameters
+
+`optimize_segmentation_hyperparameters.py` searches for segmentation settings
+that maximize agreement with the exclusive `topmost_gt_` reference. It does
+not modify the source rasters, GT, or the existing `Segmentation3` results.
+Every candidate gets a separate output directory.
+
+The study uses a deterministic, site-stratified 60/20/20 split:
+
+- candidate parameters are fitted and ranked on the tuning plots;
+- the best tuning candidates and the unchanged baseline are compared on the
+  validation plots;
+- the selected candidate is evaluated once on the untouched test plots;
+- by default, the winner is finally run on the complete dataset.
+
+The first candidate is always the current segmentation configuration. Initial
+candidates use Latin-hypercube sampling. Later candidates are proposed by a
+Random Forest surrogate using an upper-confidence-bound acquisition score, so
+the search balances promising parameter regions with uncertain regions. The
+default objective is `0.2 * PQ@0.25 + 0.6 * PQ@0.50 + 0.2 * PQ@0.75`.
+
+The optimizer searches the median-filter size, both LMF height breakpoints,
+the complete piecewise LMF window function, and watershed connectivity. The
+LMF candidates are constrained to sensible positive, generally increasing
+windows. `MIN_HEIGHT` remains fixed at 2 m because that is the threshold used
+to construct `topmost_gt_`; use `--tune-min-height` only for a deliberate
+experiment where this GT-domain mismatch is acceptable. Polygon connectivity
+remains fixed at 4 because it changes vectorization rather than the watershed
+labels.
+
+The additional dependency is `scikit-learn`. From `run_r`, start the
+recommended 40-trial study with:
+
+```bash
+../.tools/miniforge3/envs/treescan/bin/python \
+    code/optimize_segmentation_hyperparameters.py --trials 40
+```
+
+Results are written to `data_output_from_laz/parameter_optimization`. The most
+important files are:
+
+- `study_configuration.json`: immutable data split, objective, and search
+  space used by the study;
+- `leaderboard.csv`: parameters and all IoU, Dice, F1, SQ, and PQ metrics for
+  every completed phase;
+- `best_parameters.json`: selected values, tune/validation/test/full scores,
+  detailed metrics, and a ready-to-adapt segmentation command;
+- per-candidate `segmentation.log`, `evaluation.log`, predictions, and metric
+  reports, retained for auditability.
+
+The study is resumable. Run the same command again to reuse completed work, or
+increase `--trials` to continue searching. Before a long run, check the full
+pipeline on four plots with:
+
+```bash
+../.tools/miniforge3/envs/treescan/bin/python \
+    code/optimize_segmentation_hyperparameters.py \
+    --trials 1 --initial-trials 1 --validation-candidates 1 \
+    --max-plots 4 --skip-full-evaluation \
+    --study-dir /tmp/segm-opt-smoke
+```
+
+Alternative objectives are available through `--objective pq`, `f1`,
+`mean-iou`, or `area-iou`. Use a new `--study-dir` when changing the split,
+objective, GT source, seed, or search space.
