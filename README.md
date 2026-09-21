@@ -98,6 +98,35 @@ GeoPackage outputs are skipped; pass `--overwrite` to the launcher only when
 replacement is intentional. Results are written below
 `run_r/data_output_from_laz/Segmentation3`.
 
+## Convert and segment FOR-instance
+
+`for_instance_to_chm_gt.py` converts every available LAS file from the
+official `FOR-instance` directory into the same CHM, overlapping crown GT, and
+exclusive topmost-cell GT products used by the TreeScan workflow. Collection
+names are included in output IDs to prevent filename collisions, and the
+official `dev`/`test` assignment is retained in
+`for_instance_file_manifest.csv`.
+
+From the project root, generate or safely resume all input products with:
+
+```bash
+.tools/miniforge3/envs/treescan/bin/python \
+  run_r/code/for_instance_to_chm_gt.py
+```
+
+Pass `--overwrite` to rebuild existing products. Segment the resulting CHMs
+with unchanged baseline hyperparameters using:
+
+```bash
+run_r/code/python_code_run_for_instance.sh
+```
+
+The launcher writes predictions below
+`run_r/data_output_from_laz_for_instance/Segmentation3`. The Python
+segmentation workflow inherits the projected metre CRS separately from every
+CHM, which is required because FOR-instance contains collections in several
+coordinate reference systems.
+
 ## Create crown ground truth from TreeScan labels
 
 `laz_to_crown_gt.py` projects the labeled LAZ instances onto the exact grid of

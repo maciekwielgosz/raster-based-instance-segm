@@ -75,6 +75,7 @@ DEFAULT_RANDOM_SEED = 20260915
 DEFAULT_TUNE_FRACTION = 0.60
 DEFAULT_VALIDATION_FRACTION = 0.20
 DEFAULT_EXPLORATION_WEIGHT = 1.0
+DEFAULT_SEARCH_PROFILE = "broad"
 
 # The default objective emphasizes the standard IoU=0.50 operating point but
 # also rewards candidates that remain useful under looser and stricter matching.
@@ -150,6 +151,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED)
     parser.add_argument(
+        "--search-profile",
+        choices=("broad", "for-instance-refined-v2"),
+        default=DEFAULT_SEARCH_PROFILE,
+        help=(
+            "Hyperparameter search space. The FOR-instance refined profile "
+            "keeps median=1 and watershed=4, narrows the low LMF window, and "
+            "extends the upper height breakpoint to 40 m."
+        ),
+    )
+    parser.add_argument(
         "--tune-fraction", type=float, default=DEFAULT_TUNE_FRACTION
     )
     parser.add_argument(
@@ -193,6 +204,30 @@ def parse_args() -> argparse.Namespace:
         help="Validate data and print the split without running segmentation.",
     )
     return parser.parse_args()
+
+
+def apply_search_profile(profile: str) -> None:
+    """Apply a named search space before candidates are generated."""
+    global LOW_HEIGHT_RANGE
+    global HIGH_HEIGHT_MAX
+    global LOW_WINDOW_RANGE
+    global MID_WINDOW_AT_HIGH_MAX
+    global HIGH_SLOPE_RANGE
+    global MEDIAN_FILTER_CHOICES
+    global WATERSHED_CONNECTIVITY_CHOICES
+
+    if profile == "broad":
+        return
+    if profile == "for-instance-refined-v2":
+        LOW_HEIGHT_RANGE = (7.0, 15.0)
+        HIGH_HEIGHT_MAX = 40.0
+        LOW_WINDOW_RANGE = (1.75, 2.5)
+        MID_WINDOW_AT_HIGH_MAX = 4.5
+        HIGH_SLOPE_RANGE = (0.03, 0.12)
+        MEDIAN_FILTER_CHOICES = (1,)
+        WATERSHED_CONNECTIVITY_CHOICES = (4,)
+        return
+    raise ValueError(f"Unknown search profile: {profile}")
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -810,6 +845,7 @@ def study_configuration(
         },
         "primary_iou": PRIMARY_IOU,
         "seed": args.seed,
+        "search_profile": args.search_profile,
         "tune_fraction": args.tune_fraction,
         "validation_fraction": args.validation_fraction,
         "tune_min_height": args.tune_min_height,
@@ -851,6 +887,7 @@ def load_existing_tune_results(study_dir: Path) -> list[CandidateResult]:
 
 def main() -> int:
     args = parse_args()
+    apply_search_profile(args.search_profile)
     args.input_dir = args.input_dir.resolve()
     args.gt_dir = args.gt_dir.resolve()
     args.study_dir = args.study_dir.resolve()

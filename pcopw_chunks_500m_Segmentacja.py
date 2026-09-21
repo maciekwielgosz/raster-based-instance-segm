@@ -83,8 +83,9 @@ OUTPUT_DRIVER = "GPKG"
 OUTPUT_ENGINE = "pyogrio"
 OVERWRITE_EXISTING_OUTPUTS = False
 
-# Spatial and canopy-height settings
-PROJECT_CRS = "EPSG:2180"
+# Spatial and canopy-height settings. Output features inherit the projected,
+# metre-based CRS of each input CHM. This supports multi-region datasets such
+# as FOR-instance without changing any segmentation hyperparameters.
 BUFFER_METRES = 25.0  # Context around each core tile for reducing edge effects.
 MIN_HEIGHT = 2.0  # Minimum CHM height used for both detection and crowns.
 MEDIAN_FILTER_SIZE = 3  # Pixel window; use a positive odd integer.
@@ -333,10 +334,27 @@ def moving_window_size(height: np.ndarray | float) -> np.ndarray | float:
 
 def read_buffered_chm(
     chm_file: Path, vrt_path: Path | None
-) -> tuple[np.ndarray, rasterio.Affine, rasterio.coords.BoundingBox]:
+) -> tuple[
+    np.ndarray,
+    rasterio.Affine,
+    rasterio.coords.BoundingBox,
+    rasterio.crs.CRS,
+]:
     """Read the configured buffer from a VRT or pad one independent tile."""
     with rasterio.open(chm_file) as core_source:
         core_bounds = core_source.bounds
+        core_crs = core_source.crs
+
+    if core_crs is None:
+        raise ValueError(f"CHM has no CRS: {chm_file.name}")
+    if not core_crs.is_projected:
+        raise ValueError(f"CHM CRS must be projected: {chm_file.name} ({core_crs})")
+    unit_name, unit_factor = core_crs.linear_units_factor
+    if not math.isclose(float(unit_factor), 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            f"CHM CRS must use metre units: {chm_file.name} "
+            f"({core_crs}, {unit_name})"
+        )
 
     buffered_bounds = (
         core_bounds.left - BUFFER_METRES,
@@ -347,6 +365,11 @@ def read_buffered_chm(
 
     raster_path = vrt_path if vrt_path is not None else chm_file
     with rasterio.open(raster_path) as raster_source:
+        if raster_source.crs != core_crs:
+            raise ValueError(
+                f"CRS mismatch between {chm_file.name} ({core_crs}) and "
+                f"{raster_path.name} ({raster_source.crs})"
+            )
         window = from_bounds(*buffered_bounds, transform=raster_source.transform)
         window = window.round_offsets().round_lengths()
         chm = raster_source.read(
@@ -357,7 +380,7 @@ def read_buffered_chm(
         )
         transform = raster_source.window_transform(window)
 
-    return chm.filled(np.nan).astype(np.float32), transform, core_bounds
+    return chm.filled(np.nan).astype(np.float32), transform, core_bounds, core_crs
 
 
 def smooth_chm(chm: np.ndarray) -> np.ndarray:
@@ -386,13 +409,15 @@ def circular_footprint(radius: float, x_resolution: float, y_resolution: float) 
 
 
 def locate_trees_lmf(
-    chm: np.ndarray, transform: rasterio.Affine
+    chm: np.ndarray,
+    transform: rasterio.Affine,
+    crs: rasterio.crs.CRS,
 ) -> tuple[gpd.GeoDataFrame, np.ndarray]:
     """Reproduce lidR's variable circular local-maximum filter for a raster."""
     valid = np.isfinite(chm)
     eligible = valid & (chm >= MIN_HEIGHT)
     if not np.any(eligible):
-        return empty_treetops(), np.zeros(chm.shape, dtype=np.int32)
+        return empty_treetops(crs), np.zeros(chm.shape, dtype=np.int32)
 
     x_resolution = abs(float(transform.a))
     y_resolution = abs(float(transform.e))
@@ -451,7 +476,7 @@ def locate_trees_lmf(
         detected.append((int(row), int(col), height))
 
     if not detected:
-        return empty_treetops(), np.zeros(chm.shape, dtype=np.int32)
+        return empty_treetops(crs), np.zeros(chm.shape, dtype=np.int32)
 
     tree_ids = np.arange(1, len(detected) + 1, dtype=np.int32)
     heights = np.asarray([item[2] for item in detected], dtype=np.float64)
@@ -466,16 +491,16 @@ def locate_trees_lmf(
     treetops = gpd.GeoDataFrame(
         {"treeID": tree_ids, "Z": heights},
         geometry=geometries,
-        crs=PROJECT_CRS,
+        crs=crs,
     )
     return treetops, marker_raster
 
 
-def empty_treetops() -> gpd.GeoDataFrame:
+def empty_treetops(crs: rasterio.crs.CRS) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(
         {"treeID": np.asarray([], dtype=np.int32), "Z": np.asarray([], dtype=float)},
-        geometry=gpd.GeoSeries([], crs=PROJECT_CRS),
-        crs=PROJECT_CRS,
+        geometry=gpd.GeoSeries([], crs=crs),
+        crs=crs,
     )
 
 
@@ -624,6 +649,7 @@ def segment_crowns(
     transform: rasterio.Affine,
     marker_raster: np.ndarray,
     core_tree_ids: set[int],
+    crs: rasterio.crs.CRS,
 ) -> gpd.GeoDataFrame:
     """Perform marker-controlled watershed and polygonize retained crowns."""
     canopy_mask = np.isfinite(chm) & (chm >= MIN_HEIGHT)
@@ -655,7 +681,7 @@ def segment_crowns(
     crowns = gpd.GeoDataFrame(
         {"treeID": np.asarray(tree_ids, dtype=np.int32)},
         geometry=polygons,
-        crs=PROJECT_CRS,
+        crs=crs,
     )
     crowns["area_m2"] = crowns.geometry.area.astype(float)
     return crowns
@@ -750,7 +776,7 @@ def process_tile(
         )
 
     try:
-        chm, transform, core_bounds = read_buffered_chm(chm_file, vrt_path)
+        chm, transform, core_bounds, chm_crs = read_buffered_chm(chm_file, vrt_path)
         finite = chm[np.isfinite(chm)]
         if finite.size == 0 or float(np.max(finite)) < MIN_HEIGHT:
             return TileResult(
@@ -760,7 +786,7 @@ def process_tile(
             )
 
         smoothed = smooth_chm(chm)
-        all_treetops, markers = locate_trees_lmf(smoothed, transform)
+        all_treetops, markers = locate_trees_lmf(smoothed, transform, chm_crs)
         if all_treetops.empty:
             return TileResult(tile_id, "empty", detail="no local maxima detected")
 
@@ -773,7 +799,13 @@ def process_tile(
             dbh_naslund(final_treetops["Z"].to_numpy()), DBH_DECIMAL_PLACES
         )
         core_tree_ids = set(final_treetops["treeID"].astype(int))
-        final_crowns = segment_crowns(smoothed, transform, markers, core_tree_ids)
+        final_crowns = segment_crowns(
+            smoothed,
+            transform,
+            markers,
+            core_tree_ids,
+            chm_crs,
+        )
 
         if len(final_crowns) != len(final_treetops):
             raise RuntimeError(
