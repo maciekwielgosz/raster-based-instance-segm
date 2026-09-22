@@ -52,7 +52,7 @@ import rasterio
 from rasterio.features import shapes
 from rasterio.transform import xy
 from rasterio.windows import from_bounds
-from scipy.ndimage import generic_filter, maximum_filter
+from scipy.ndimage import convolve, gaussian_filter, generic_filter, maximum_filter
 from shapely.geometry import Point, shape
 from shapely.ops import unary_union
 from tqdm import tqdm
@@ -89,6 +89,9 @@ OVERWRITE_EXISTING_OUTPUTS = False
 BUFFER_METRES = 25.0  # Context around each core tile for reducing edge effects.
 MIN_HEIGHT = 2.0  # Minimum CHM height used for both detection and crowns.
 MEDIAN_FILTER_SIZE = 3  # Pixel window; use a positive odd integer.
+CHM_PIT_FILL_SIZE = 1  # Odd pixel window; 1 disables local pit filling.
+CHM_PIT_DEPTH = 0.0  # Minimum depression depth replaced by the local median.
+CHM_GAUSSIAN_SIGMA = 0.0  # Pixel standard deviation; 0 disables smoothing.
 
 # Variable local-maximum-filter window diameter f_ws(height), in metres:
 #   height < LMF_LOW_HEIGHT_LIMIT:  LMF_LOW_WINDOW_SIZE
@@ -101,6 +104,12 @@ LMF_MID_SLOPE = 0.1
 LMF_MID_INTERCEPT = 0.3
 LMF_HIGH_SLOPE = 0.15
 LMF_HIGH_INTERCEPT = 1.0
+
+# Optional monotonic four-point LMF curve. When all values are supplied on the
+# command line, it replaces the legacy three-piece function above. The first
+# control height is MIN_HEIGHT and the remaining heights are configurable.
+LMF_CONTROL_HEIGHTS: tuple[float, float, float, float] | None = None
+LMF_CONTROL_WINDOWS: tuple[float, float, float, float] | None = None
 
 # Marker-controlled watershed and raster-to-polygon settings
 WATERSHED_CONNECTIVITY = 8  # Allowed values: 4 or 8; ForestTools uses 8.
@@ -183,6 +192,24 @@ def parse_args() -> argparse.Namespace:
         help=f"Positive odd median-filter window size; default {MEDIAN_FILTER_SIZE}.",
     )
     parser.add_argument(
+        "--chm-pit-fill-size",
+        type=int,
+        default=CHM_PIT_FILL_SIZE,
+        help="Odd focal window in pixels for conditional CHM pit filling; 1 disables it.",
+    )
+    parser.add_argument(
+        "--chm-pit-depth",
+        type=float,
+        default=CHM_PIT_DEPTH,
+        help="Minimum depth below the focal median that is treated as a CHM pit.",
+    )
+    parser.add_argument(
+        "--chm-gaussian-sigma",
+        type=float,
+        default=CHM_GAUSSIAN_SIGMA,
+        help="Gaussian smoothing sigma in pixels; 0 disables it.",
+    )
+    parser.add_argument(
         "--lmf-low-height-limit",
         type=float,
         default=LMF_LOW_HEIGHT_LIMIT,
@@ -224,6 +251,20 @@ def parse_args() -> argparse.Namespace:
         default=LMF_HIGH_INTERCEPT,
         help=f"Upper LMF line intercept; default {LMF_HIGH_INTERCEPT:g} m.",
     )
+    for index in range(1, 4):
+        parser.add_argument(
+            f"--lmf-control-height-{index}",
+            type=float,
+            default=None,
+            help=f"Height of flexible LMF control point {index}; requires all control values.",
+        )
+    for index in range(4):
+        parser.add_argument(
+            f"--lmf-control-window-{index}",
+            type=float,
+            default=None,
+            help=f"Window diameter at flexible LMF control point {index}; requires all control values.",
+        )
     parser.add_argument(
         "--watershed-connectivity",
         type=int,
@@ -245,6 +286,9 @@ def apply_cli_hyperparameters(args: argparse.Namespace) -> None:
     """Validate and apply optional CLI overrides without changing defaults."""
     global MIN_HEIGHT
     global MEDIAN_FILTER_SIZE
+    global CHM_PIT_FILL_SIZE
+    global CHM_PIT_DEPTH
+    global CHM_GAUSSIAN_SIGMA
     global LMF_LOW_HEIGHT_LIMIT
     global LMF_HIGH_HEIGHT_LIMIT
     global LMF_LOW_WINDOW_SIZE
@@ -252,6 +296,8 @@ def apply_cli_hyperparameters(args: argparse.Namespace) -> None:
     global LMF_MID_INTERCEPT
     global LMF_HIGH_SLOPE
     global LMF_HIGH_INTERCEPT
+    global LMF_CONTROL_HEIGHTS
+    global LMF_CONTROL_WINDOWS
     global WATERSHED_CONNECTIVITY
     global POLYGON_CONNECTIVITY
 
@@ -264,6 +310,8 @@ def apply_cli_hyperparameters(args: argparse.Namespace) -> None:
         "--lmf-mid-intercept": args.lmf_mid_intercept,
         "--lmf-high-slope": args.lmf_high_slope,
         "--lmf-high-intercept": args.lmf_high_intercept,
+        "--chm-pit-depth": args.chm_pit_depth,
+        "--chm-gaussian-sigma": args.chm_gaussian_sigma,
     }
     non_finite = [name for name, value in numeric_values.items() if not math.isfinite(value)]
     if non_finite:
@@ -272,6 +320,12 @@ def apply_cli_hyperparameters(args: argparse.Namespace) -> None:
         raise ValueError("--min-height must be non-negative")
     if args.median_filter_size < 1 or args.median_filter_size % 2 == 0:
         raise ValueError("--median-filter-size must be a positive odd integer")
+    if args.chm_pit_fill_size < 1 or args.chm_pit_fill_size % 2 == 0:
+        raise ValueError("--chm-pit-fill-size must be a positive odd integer")
+    if args.chm_pit_depth < 0:
+        raise ValueError("--chm-pit-depth must be non-negative")
+    if args.chm_gaussian_sigma < 0:
+        raise ValueError("--chm-gaussian-sigma must be non-negative")
     if args.lmf_low_height_limit < 0:
         raise ValueError("--lmf-low-height-limit must be non-negative")
     if args.lmf_high_height_limit <= args.lmf_low_height_limit:
@@ -293,8 +347,37 @@ def apply_cli_hyperparameters(args: argparse.Namespace) -> None:
     if min(*middle_windows, upper_window) <= 0:
         raise ValueError("The configured LMF window function must stay positive")
 
+    control_heights = tuple(
+        getattr(args, f"lmf_control_height_{index}") for index in range(1, 4)
+    )
+    control_windows = tuple(
+        getattr(args, f"lmf_control_window_{index}") for index in range(4)
+    )
+    supplied = [value is not None for value in (*control_heights, *control_windows)]
+    if any(supplied) and not all(supplied):
+        raise ValueError("all flexible LMF control heights and windows are required")
+    if all(supplied):
+        heights = (args.min_height, *(float(value) for value in control_heights))
+        windows = tuple(float(value) for value in control_windows)
+        if any(not math.isfinite(value) for value in (*heights, *windows)):
+            raise ValueError("flexible LMF control values must be finite")
+        if any(right <= left for left, right in zip(heights, heights[1:])):
+            raise ValueError("flexible LMF control heights must be strictly increasing")
+        if any(value <= 0 for value in windows):
+            raise ValueError("flexible LMF control windows must be positive")
+        if any(right < left for left, right in zip(windows, windows[1:])):
+            raise ValueError("flexible LMF control windows must be non-decreasing")
+        LMF_CONTROL_HEIGHTS = heights
+        LMF_CONTROL_WINDOWS = windows
+    else:
+        LMF_CONTROL_HEIGHTS = None
+        LMF_CONTROL_WINDOWS = None
+
     MIN_HEIGHT = args.min_height
     MEDIAN_FILTER_SIZE = args.median_filter_size
+    CHM_PIT_FILL_SIZE = args.chm_pit_fill_size
+    CHM_PIT_DEPTH = args.chm_pit_depth
+    CHM_GAUSSIAN_SIGMA = args.chm_gaussian_sigma
     LMF_LOW_HEIGHT_LIMIT = args.lmf_low_height_limit
     LMF_HIGH_HEIGHT_LIMIT = args.lmf_high_height_limit
     LMF_LOW_WINDOW_SIZE = args.lmf_low_window_size
@@ -321,6 +404,10 @@ def dbh_naslund(
 
 def moving_window_size(height: np.ndarray | float) -> np.ndarray | float:
     """Variable LMF window diameter, in metres, matching ``f_ws`` in R."""
+    if LMF_CONTROL_HEIGHTS is not None and LMF_CONTROL_WINDOWS is not None:
+        values = np.asarray(height)
+        interpolated = np.interp(values, LMF_CONTROL_HEIGHTS, LMF_CONTROL_WINDOWS)
+        return float(interpolated) if np.ndim(values) == 0 else interpolated
     return np.where(
         np.asarray(height) < LMF_LOW_HEIGHT_LIMIT,
         LMF_LOW_WINDOW_SIZE,
@@ -383,12 +470,66 @@ def read_buffered_chm(
     return chm.filled(np.nan).astype(np.float32), transform, core_bounds, core_crs
 
 
+def improve_chm(chm: np.ndarray) -> np.ndarray:
+    """Conditionally fill canopy pits and smooth CHM values without GT data."""
+    improved = chm.astype(np.float64, copy=True)
+    if CHM_PIT_FILL_SIZE > 1:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+            local_median = generic_filter(
+                improved,
+                np.nanmedian,
+                size=CHM_PIT_FILL_SIZE,
+                output=np.float64,
+                mode="constant",
+                cval=np.nan,
+            )
+        finite_count = convolve(
+            np.isfinite(improved).astype(np.int16),
+            np.ones((CHM_PIT_FILL_SIZE, CHM_PIT_FILL_SIZE), dtype=np.int16),
+            mode="constant",
+            cval=0,
+        )
+        required = math.ceil(0.60 * CHM_PIT_FILL_SIZE**2)
+        depression = local_median - improved
+        pits = (
+            np.isfinite(local_median)
+            & (local_median >= MIN_HEIGHT)
+            & (finite_count >= required)
+            & (~np.isfinite(improved) | (depression >= CHM_PIT_DEPTH))
+        )
+        improved[pits] = local_median[pits]
+
+    if CHM_GAUSSIAN_SIGMA > 0:
+        valid = np.isfinite(improved)
+        weighted_values = gaussian_filter(
+            np.where(valid, improved, 0.0),
+            sigma=CHM_GAUSSIAN_SIGMA,
+            mode="nearest",
+        )
+        weights = gaussian_filter(
+            valid.astype(np.float64),
+            sigma=CHM_GAUSSIAN_SIGMA,
+            mode="nearest",
+        )
+        smoothed = np.divide(
+            weighted_values,
+            weights,
+            out=np.full_like(weighted_values, np.nan),
+            where=weights > 1e-12,
+        )
+        improved[valid] = smoothed[valid]
+
+    return improved
+
+
 def smooth_chm(chm: np.ndarray) -> np.ndarray:
-    """Apply Terra-compatible median smoothing while ignoring NoData."""
+    """Improve the CHM, then apply Terra-compatible median smoothing."""
+    improved = improve_chm(chm)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="All-NaN slice encountered")
         return generic_filter(
-            chm,
+            improved,
             np.nanmedian,
             size=MEDIAN_FILTER_SIZE,
             output=np.float64,
@@ -862,10 +1003,13 @@ def main() -> int:
     print(
         "Hyperparameters: "
         f"min_height={MIN_HEIGHT:g}, median_filter={MEDIAN_FILTER_SIZE}, "
+        f"CHM pit=({CHM_PIT_FILL_SIZE}, {CHM_PIT_DEPTH:g}), "
+        f"CHM gaussian={CHM_GAUSSIAN_SIGMA:g}, "
         f"LMF breaks=({LMF_LOW_HEIGHT_LIMIT:g}, {LMF_HIGH_HEIGHT_LIMIT:g}), "
         f"LMF low={LMF_LOW_WINDOW_SIZE:g}, "
         f"LMF mid={LMF_MID_SLOPE:g}*h+{LMF_MID_INTERCEPT:g}, "
         f"LMF high={LMF_HIGH_SLOPE:g}*h+{LMF_HIGH_INTERCEPT:g}, "
+        f"LMF controls={list(zip(LMF_CONTROL_HEIGHTS, LMF_CONTROL_WINDOWS)) if LMF_CONTROL_HEIGHTS else 'legacy'}, "
         f"watershed={WATERSHED_CONNECTIVITY}, polygon={POLYGON_CONNECTIVITY}"
     )
     results = [

@@ -53,6 +53,8 @@ try:
         distance_transform_edt,
         generate_binary_structure,
         label,
+        median_filter,
+        minimum_filter,
     )
     from shapely.geometry import MultiPolygon, Polygon, shape
     from shapely.ops import unary_union
@@ -95,7 +97,21 @@ TOPMOST_LAYER_NAME = "crowns_gt_topmost"
 FALLBACK_COLLECTION_CRS = {
     "RMIT": "EPSG:28355",
     "TUWIEN": "EPSG:32633",
+    # IDEAS-ALS collections distributed in local metre coordinates.  Regional
+    # projected CRSs are attached only to satisfy the raster/vector metre-CRS
+    # contract; no coordinate transformation is performed.
+    "CEDAR_CYPRESS": "EPSG:32652",
+    "FGI_EMIT": "EPSG:3067",
+    "SEPILOK": "EPSG:32650",
+    "WYTHAM": "EPSG:27700",
 }
+
+# Defaults preserve the original FOR-instance conversion exactly.  The
+# IDEAS-ALS wrapper selects the alternative modes explicitly on the CLI.
+TREE_POINT_MODE = "semantic"
+CHM_POINT_MODE = "annotated-tree"
+DTM_MODE = "class2"
+DATASET_NAME = "FOR-instance"
 
 
 @dataclass(frozen=True)
@@ -154,6 +170,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--split",
+        action="append",
+        choices=("dev", "test"),
+        default=[],
+        help="Process only this manifest split; repeatable.",
+    )
+    parser.add_argument(
+        "--tree-point-mode",
+        choices=("semantic", "instance"),
+        default=TREE_POINT_MODE,
+        help="semantic uses classes 4-6; instance uses every treeID>0 except ground/outside.",
+    )
+    parser.add_argument(
+        "--chm-point-mode",
+        choices=("annotated-tree", "all-nonground"),
+        default=CHM_POINT_MODE,
+        help="Points used to build the CHM surface.",
+    )
+    parser.add_argument(
+        "--dtm-mode",
+        choices=("class2", "auto", "zero", "cell-min"),
+        default=DTM_MODE,
+        help="Terrain normalization method; auto prefers class 2, then normalized Z or a lower envelope.",
+    )
+    parser.add_argument("--dataset-name", default=DATASET_NAME)
+    parser.add_argument("--manifest-name", default=OUTPUT_MANIFEST_FILENAME)
     return parser.parse_args()
 
 
@@ -312,6 +355,16 @@ def integer_tree_ids(points) -> np.ndarray:
     return raw.astype(np.int64, copy=False)
 
 
+def annotated_tree_points(tree_ids: np.ndarray, classification: np.ndarray) -> np.ndarray:
+    if TREE_POINT_MODE == "semantic":
+        return (tree_ids > 0) & np.isin(classification, TREE_CLASSES)
+    if TREE_POINT_MODE == "instance":
+        return (tree_ids > 0) & ~np.isin(
+            classification, (GROUND_CLASS, OUTSIDE_CLASS)
+        )
+    raise ValueError(f"Unexpected tree point mode: {TREE_POINT_MODE}")
+
+
 def first_pass(
     source: SourcePlot,
     grid: Grid,
@@ -347,13 +400,15 @@ def first_pass(
             np.add.at(ground_sum, cells[ground], z_values[ground])
             np.add.at(ground_count, cells[ground], 1)
 
-            annotated_tree = (ids > 0) & np.isin(classes, TREE_CLASSES)
+            annotated_tree = annotated_tree_points(ids, classes)
             present_tree_ids.update(int(value) for value in np.unique(ids[annotated_tree]))
 
     return coverage_count, ground_sum, ground_count, present_tree_ids
 
 
-def build_dtm(ground_sum: np.ndarray, ground_count: np.ndarray, grid: Grid) -> np.ndarray:
+def class2_dtm(
+    ground_sum: np.ndarray, ground_count: np.ndarray, grid: Grid
+) -> np.ndarray:
     known = ground_count > 0
     if not np.any(known):
         raise ValueError("No class-2 terrain points available for height normalization")
@@ -369,9 +424,66 @@ def build_dtm(ground_sum: np.ndarray, ground_count: np.ndarray, grid: Grid) -> n
     return dtm[tuple(nearest_indices)]
 
 
-def plot_id_from_source(source: SourcePlot) -> int | None:
-    match = re.fullmatch(r"plot_(\d+)_annotated", source.source_path.stem)
-    return int(match.group(1)) if match else None
+def lower_envelope_dtm(source: SourcePlot, grid: Grid) -> np.ndarray:
+    """Approximate terrain from the spatial lower envelope when ground is unlabelled."""
+    surface_min = np.full(grid.cell_count, np.inf, dtype=np.float64)
+    with laspy.open(source.source_path) as reader:
+        for points in reader.chunk_iterator(CHUNK_SIZE_POINTS):
+            x = np.asarray(points.x, dtype=np.float64)
+            y = np.asarray(points.y, dtype=np.float64)
+            z = np.asarray(points.z, dtype=np.float64)
+            classification = np.asarray(points.classification, dtype=np.uint8)
+            selected = (
+                np.isfinite(x)
+                & np.isfinite(y)
+                & np.isfinite(z)
+                & (classification != OUTSIDE_CLASS)
+            )
+            if not np.any(selected):
+                continue
+            rows, columns = point_cells(x[selected], y[selected], grid)
+            cells = rows * grid.width + columns
+            np.minimum.at(surface_min, cells, z[selected])
+    known = np.isfinite(surface_min)
+    if not np.any(known):
+        raise ValueError("No finite points available for lower-envelope DTM")
+    surface = surface_min.reshape((grid.height, grid.width))
+    known_2d = known.reshape((grid.height, grid.width))
+    nearest_indices = distance_transform_edt(
+        ~known_2d, return_distances=False, return_indices=True
+    )
+    surface = surface[tuple(nearest_indices)]
+    # A 2.5 m erosion followed by a 4.5 m median removes isolated low returns
+    # while retaining broad terrain slope on the small benchmark plots.
+    return median_filter(minimum_filter(surface, size=5), size=9)
+
+
+def build_dtm(
+    source: SourcePlot,
+    ground_sum: np.ndarray,
+    ground_count: np.ndarray,
+    grid: Grid,
+) -> tuple[np.ndarray, str]:
+    if DTM_MODE == "class2":
+        return class2_dtm(ground_sum, ground_count, grid), "class2-nearest"
+    if DTM_MODE == "zero":
+        return np.zeros((grid.height, grid.width), dtype=np.float64), "zero-normalized"
+    if DTM_MODE == "cell-min":
+        return lower_envelope_dtm(source, grid), "cell-min-lower-envelope"
+    if DTM_MODE != "auto":
+        raise ValueError(f"Unexpected DTM mode: {DTM_MODE}")
+    if np.any(ground_count > 0):
+        return class2_dtm(ground_sum, ground_count, grid), "class2-nearest"
+    with laspy.open(source.source_path) as reader:
+        minimum_z = float(reader.header.mins[2])
+    if minimum_z <= 2.0:
+        return np.zeros((grid.height, grid.width), dtype=np.float64), "zero-normalized"
+    return lower_envelope_dtm(source, grid), "cell-min-lower-envelope"
+
+
+def plot_id_from_source(source: SourcePlot) -> str | None:
+    match = re.fullmatch(r"plot_(.+)_annotated", source.source_path.stem)
+    return match.group(1) if match else None
 
 
 def read_tree_metadata(
@@ -391,13 +503,14 @@ def read_tree_metadata(
             raise ValueError(f"Unexpected columns in {metadata_path}")
         for row in reader:
             if "plotID" in fields and plot_id is not None:
-                if int(float(row["plotID"])) != plot_id:
+                if row["plotID"].strip() != plot_id:
                     continue
             tree_id = int(float(row["treeID"]))
             if tree_id not in present_tree_ids:
                 continue
-            dbh_cm = float(row["DBH"])
-            if not math.isfinite(dbh_cm) or dbh_cm <= 0:
+            raw_dbh = row["DBH"].strip()
+            dbh_cm = float(raw_dbh) if raw_dbh else math.nan
+            if math.isfinite(dbh_cm) and dbh_cm <= 0:
                 raise ValueError(f"Invalid DBH for tree {tree_id} in {metadata_path}")
             if tree_id in records:
                 raise ValueError(f"Duplicate treeID {tree_id} in {metadata_path}")
@@ -419,11 +532,12 @@ def second_pass(
     grid: Grid,
     dtm: np.ndarray,
     tree_metadata: dict[int, TreeMetadata],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     sorted_tree_ids = np.asarray(sorted(tree_metadata), dtype=np.int64)
     raw_masks = np.zeros((len(sorted_tree_ids), grid.cell_count), dtype=bool)
     point_counts = np.zeros(len(sorted_tree_ids), dtype=np.int64)
-    best_height = np.full(grid.cell_count, -np.inf, dtype=np.float64)
+    annotated_best_height = np.full(grid.cell_count, -np.inf, dtype=np.float64)
+    chm_best_height = np.full(grid.cell_count, -np.inf, dtype=np.float64)
     winner_tree_id = np.zeros(grid.cell_count, dtype=np.int64)
     flat_dtm = dtm.ravel()
 
@@ -434,13 +548,28 @@ def second_pass(
             z = np.asarray(points.z, dtype=np.float64)
             classification = np.asarray(points.classification, dtype=np.uint8)
             tree_ids = integer_tree_ids(points)
-            selected = (
-                np.isfinite(x)
-                & np.isfinite(y)
-                & np.isfinite(z)
-                & (tree_ids > 0)
-                & np.isin(classification, TREE_CLASSES)
-            )
+            finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+
+            if CHM_POINT_MODE == "all-nonground":
+                chm_selected = finite & ~np.isin(
+                    classification, (GROUND_CLASS, OUTSIDE_CLASS)
+                )
+                if np.any(chm_selected):
+                    chm_rows, chm_columns = point_cells(
+                        x[chm_selected], y[chm_selected], grid
+                    )
+                    chm_cells = chm_rows * grid.width + chm_columns
+                    chm_heights = z[chm_selected] - flat_dtm[chm_cells]
+                    valid_chm = np.isfinite(chm_heights) & (chm_heights >= 0)
+                    np.maximum.at(
+                        chm_best_height,
+                        chm_cells[valid_chm],
+                        chm_heights[valid_chm],
+                    )
+            elif CHM_POINT_MODE != "annotated-tree":
+                raise ValueError(f"Unexpected CHM point mode: {CHM_POINT_MODE}")
+
+            selected = finite & annotated_tree_points(tree_ids, classification)
             if not np.any(selected):
                 continue
             x = x[selected]
@@ -477,16 +606,24 @@ def second_pass(
             candidate_cells = cells[chosen]
             candidate_heights = heights[chosen]
             candidate_ids = ids[chosen]
-            current_heights = best_height[candidate_cells]
+            current_heights = annotated_best_height[candidate_cells]
             current_ids = winner_tree_id[candidate_cells]
             better = candidate_heights > current_heights + 1e-9
             tied = np.abs(candidate_heights - current_heights) <= 1e-9
             better |= tied & ((current_ids == 0) | (candidate_ids < current_ids))
             update_cells = candidate_cells[better]
-            best_height[update_cells] = candidate_heights[better]
+            annotated_best_height[update_cells] = candidate_heights[better]
             winner_tree_id[update_cells] = candidate_ids[better]
 
-    return sorted_tree_ids, raw_masks, point_counts, np.vstack((best_height, winner_tree_id))
+    if CHM_POINT_MODE == "annotated-tree":
+        chm_best_height = annotated_best_height.copy()
+    return (
+        sorted_tree_ids,
+        raw_masks,
+        point_counts,
+        np.vstack((annotated_best_height, winner_tree_id)),
+        chm_best_height,
+    )
 
 
 def largest_component(mask: np.ndarray) -> np.ndarray:
@@ -662,6 +799,7 @@ def write_outputs(
     labels: np.ndarray,
     overlapping_gt: gpd.GeoDataFrame,
     topmost_gt: gpd.GeoDataFrame,
+    dtm_method: str,
 ) -> None:
     token = uuid.uuid4().hex
     temporary = {
@@ -673,14 +811,16 @@ def write_outputs(
             temporary["chm"], "w", **raster_profile(grid, crs, "float32", CHM_NODATA)
         ) as destination:
             destination.write(chm.astype(np.float32), 1)
-            destination.set_band_description(1, "canopy height above class-2 terrain")
+            destination.set_band_description(1, f"canopy height; DTM={dtm_method}")
             destination.update_tags(
-                DATASET="FOR-instance",
+                DATASET=DATASET_NAME,
                 COLLECTION=source.collection,
                 SPLIT=source.split,
                 SOURCE_LAS=source.relative_path,
                 PIXEL_SIZE_METRES=str(PIXEL_SIZE_METRES),
-                TREE_CLASSES="4,5,6",
+                TREE_POINT_MODE=TREE_POINT_MODE,
+                CHM_POINT_MODE=CHM_POINT_MODE,
+                DTM_METHOD=dtm_method,
                 EXCLUDED_OUTSIDE_CLASS=str(OUTSIDE_CLASS),
             )
         with rasterio.open(
@@ -691,7 +831,7 @@ def write_outputs(
             destination.write(labels.astype(np.int32), 1)
             destination.set_band_description(1, "topmost crown instance ID")
             destination.update_tags(
-                DATASET="FOR-instance",
+                DATASET=DATASET_NAME,
                 COLLECTION=source.collection,
                 SPLIT=source.split,
                 SOURCE_LAS=source.relative_path,
@@ -772,26 +912,30 @@ def convert_source(
 
     coverage_count, ground_sum, ground_count, present_ids = first_pass(source, grid)
     tree_metadata = read_tree_metadata(source, input_dir, present_ids)
-    dtm = build_dtm(ground_sum, ground_count, grid)
-    tree_ids, raw_masks, point_counts, winner_data = second_pass(
+    dtm, dtm_method = build_dtm(source, ground_sum, ground_count, grid)
+    tree_ids, raw_masks, point_counts, winner_data, chm_best_height = second_pass(
         source, grid, dtm, tree_metadata
     )
-    best_height = winner_data[0]
+    annotated_best_height = winner_data[0]
     winner_tree_id = winner_data[1].astype(np.int64)
     coverage = coverage_count > 0
 
     chm_flat = np.full(grid.cell_count, CHM_NODATA, dtype=np.float32)
     chm_flat[coverage] = 0.0
-    canopy = np.isfinite(best_height) & coverage
-    chm_flat[canopy] = best_height[canopy].astype(np.float32)
+    canopy = np.isfinite(chm_best_height) & coverage
+    chm_flat[canopy] = chm_best_height[canopy].astype(np.float32)
     chm = chm_flat.reshape((grid.height, grid.width))
 
     labels_flat = np.full(grid.cell_count, LABEL_NODATA, dtype=np.int32)
     labels_flat[coverage] = 0
-    visible = canopy & (best_height >= MIN_CANOPY_HEIGHT_METRES)
+    visible = (
+        np.isfinite(annotated_best_height)
+        & coverage
+        & (annotated_best_height >= MIN_CANOPY_HEIGHT_METRES)
+    )
     labels_flat[visible] = winner_tree_id[visible].astype(np.int32)
     labels = labels_flat.reshape((grid.height, grid.width))
-    heights = best_height.reshape((grid.height, grid.width))
+    heights = annotated_best_height.reshape((grid.height, grid.width))
 
     overlapping_gt = build_overlapping_gt(
         source, crs, grid, tree_ids, raw_masks, point_counts, tree_metadata
@@ -808,11 +952,12 @@ def convert_source(
         labels,
         overlapping_gt,
         topmost_gt,
+        dtm_method,
     )
     fallback_note = " (fallback CRS)" if used_fallback else ""
     print(
         f"created {source.dataset_id}: {len(overlapping_gt)} GT trees, "
-        f"{len(topmost_gt)} topmost trees, {crs}{fallback_note}",
+        f"{len(topmost_gt)} topmost trees, DTM={dtm_method}, {crs}{fallback_note}",
         flush=True,
     )
     return ConversionResult(
@@ -826,8 +971,10 @@ def convert_source(
     )
 
 
-def write_manifest(output_dir: Path, all_sources: list[SourcePlot]) -> None:
-    path = output_dir / OUTPUT_MANIFEST_FILENAME
+def write_manifest(
+    output_dir: Path, all_sources: list[SourcePlot], manifest_name: str
+) -> None:
+    path = output_dir / manifest_name
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     fields = [
         "dataset_id",
@@ -863,7 +1010,12 @@ def write_manifest(output_dir: Path, all_sources: list[SourcePlot]) -> None:
 
 
 def main() -> int:
+    global TREE_POINT_MODE, CHM_POINT_MODE, DTM_MODE, DATASET_NAME
     args = parse_args()
+    TREE_POINT_MODE = args.tree_point_mode
+    CHM_POINT_MODE = args.chm_point_mode
+    DTM_MODE = args.dtm_mode
+    DATASET_NAME = args.dataset_name
     input_dir = args.input_dir.resolve()
     output_dir = args.output_dir.resolve()
     if not input_dir.is_dir():
@@ -871,15 +1023,23 @@ def main() -> int:
         return 2
     try:
         all_sources = read_sources(input_dir)
+        if args.split:
+            requested_splits = set(args.split)
+            all_sources = [
+                source for source in all_sources if source.split in requested_splits
+            ]
         selected = select_sources(all_sources, args.file)
     except (FileNotFoundError, ValueError) as error:
         print(f"Input validation failed: {error}", file=sys.stderr)
         return 2
 
-    print(f"FOR-instance input: {input_dir}")
+    print(f"{DATASET_NAME} input: {input_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Selected LAS files: {len(selected)} of {len(all_sources)}")
     print(f"Pixel size: {PIXEL_SIZE_METRES} m")
+    print(
+        f"Modes: tree={TREE_POINT_MODE}, CHM={CHM_POINT_MODE}, DTM={DTM_MODE}"
+    )
     if args.dry_run:
         for source in selected:
             print(
@@ -899,7 +1059,7 @@ def main() -> int:
             results.append(
                 convert_source(source, input_dir, output_dir, args.overwrite)
             )
-        write_manifest(output_dir, all_sources)
+        write_manifest(output_dir, selected, args.manifest_name)
     except Exception as error:
         print(f"Conversion failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1

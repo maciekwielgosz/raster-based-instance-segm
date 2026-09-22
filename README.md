@@ -127,6 +127,99 @@ segmentation workflow inherits the projected metre CRS separately from every
 CHM, which is required because FOR-instance contains collections in several
 coordinate reference systems.
 
+The converter also supports FOR-instance-like datasets whose instance labels
+are carried by `treeID` but whose semantic classes differ. The options
+`--tree-point-mode instance`, `--chm-point-mode all-nonground`, and
+`--dtm-mode auto` keep the instance GT separate from the points used to create
+the CHM and select an available terrain-normalization method.
+
+## Prepare and optimize on IDEAS-ALS
+
+`python_code_run_ideas_als.sh` provides the isolated IDEAS-ALS flow. It uses
+only the 193 files marked `dev`, writes prepared CHM/GT products to
+`run_r/data_input_from_laz_ideas_als_dev`, and writes all optimization runs to
+`run_r/optimization_ideas_als_dev_weighted_pq_v1`. The 359 IDEAS-ALS files
+marked `test` are not read by the optimization.
+
+From the project root:
+
+```bash
+run_r/code/python_code_run_ideas_als.sh
+```
+
+The launcher is resumable: completed preparation products and completed
+optimization candidates are reused. IDEAS-ALS uses positive `treeID` values as
+instances, all non-ground/non-outside points for the CHM, and automatic DTM
+selection (class-2 terrain, already normalized Z, or a lower-envelope DTM).
+After selecting the winner, the launcher calls `evaluate_best_parameters.py`
+to freeze those parameters and evaluate them on the separate 21-plot
+FOR-instance dev view. Transfer outputs are written below
+`run_r/evaluation_for_instance_ideas_als_opt_v1`.
+
+### Source-balanced LOSO v2
+
+`python_code_run_ideas_als_loso_v2.sh` runs the more intensive IDEAS-ALS
+experiment in a separate study directory. It evaluates 64 candidates, gives
+each of the eight source collections equal weight, uses one random-forest
+surrogate per leave-one-source-out fold, and searches a space shifted toward
+smaller LMF windows. The existing IDEAS v1 winner is included as an incumbent
+so the new search must improve on it rather than merely differ from it.
+
+From the project root:
+
+```bash
+run_r/code/python_code_run_ideas_als_loso_v2.sh
+```
+
+Optimization artifacts are written to
+`run_r/optimization_ideas_als_source_balanced_loso_v2`. The source-balanced
+leaderboard and LOSO selections are stored in
+`candidate_source_leaderboard.csv` and
+`leave_one_source_out_selection.csv`. FOR-instance is not read during the
+search; the frozen winner is evaluated there only at the final transfer step,
+whose outputs are under
+`run_r/evaluation_for_instance_ideas_als_source_balanced_loso_v2`.
+
+### CHM and flexible-LMF v3
+
+`python_code_run_ideas_als_chm_lmf_v3.sh` adds two optional CHM operations
+(conditional focal pit filling and NoData-aware Gaussian smoothing) and a
+monotonic LMF curve defined by four height/window control points. Both CHM
+operations default to disabled, so legacy runs remain reproducible. The v3
+optimizer evaluates 80 candidates on the same source-balanced IDEAS-ALS dev
+view and retains the v2 winner as an incumbent.
+
+```bash
+run_r/code/python_code_run_ideas_als_chm_lmf_v3.sh
+```
+
+The isolated study directory is
+`run_r/optimization_ideas_als_chm_flexible_lmf_v3`; its formally selected
+winner is transferred to
+`run_r/evaluation_for_instance_ideas_als_chm_flexible_lmf_v3_selected` only
+after selection. The completed experiment also keeps an explicitly labelled
+post-selection ablation of the best genuinely new flexible-LMF candidate in
+`run_r/evaluation_for_instance_ideas_als_chm_flexible_lmf_v3_best_new`.
+
+### CHM structural classes v4
+
+`evaluate_structural_ensemble.py` fits a three-class router using only four CHM
+features: canopy cover above 2 m, canopy-height median, 95th percentile, and
+height standard deviation. A robust scaler and deterministic KMeans model are
+fit on IDEAS-ALS dev CHMs; no GT labels are used for routing. Each target plot
+is then segmented with one of three frozen parameter sets.
+
+The completed v4 experiment selected the parameter triplet jointly from the
+80 v3 candidates using the final equal-source IDEAS-ALS PQ. Its reproducible
+launcher is:
+
+```bash
+run_r/code/python_code_run_ideas_als_structural_v4.sh
+```
+
+Outputs, the full routing manifest, and per-plot structural assignments are
+under `run_r/evaluation_for_instance_ideas_als_structural_classes_v4`.
+
 ## Create crown ground truth from TreeScan labels
 
 `laz_to_crown_gt.py` projects the labeled LAZ instances onto the exact grid of

@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED)
     parser.add_argument(
         "--search-profile",
-        choices=("broad", "for-instance-refined-v2"),
+        choices=("broad", "for-instance-refined-v2", "ideas-als-small-windows-v2"),
         default=DEFAULT_SEARCH_PROFILE,
         help=(
             "Hyperparameter search space. The FOR-instance refined profile "
@@ -176,7 +176,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--objective",
-        choices=("weighted-pq", "pq", "f1", "mean-iou", "area-iou"),
+        choices=(
+            "weighted-pq",
+            "source-balanced-pq",
+            "pq",
+            "f1",
+            "mean-iou",
+            "area-iou",
+        ),
         default=DEFAULT_OBJECTIVE,
     )
     parser.add_argument(
@@ -225,6 +232,16 @@ def apply_search_profile(profile: str) -> None:
         MID_WINDOW_AT_HIGH_MAX = 4.5
         HIGH_SLOPE_RANGE = (0.03, 0.12)
         MEDIAN_FILTER_CHOICES = (1,)
+        WATERSHED_CONNECTIVITY_CHOICES = (4,)
+        return
+    if profile == "ideas-als-small-windows-v2":
+        LOW_HEIGHT_RANGE = (6.0, 14.0)
+        HIGH_HEIGHT_MAX = 36.0
+        LOW_WINDOW_RANGE = (1.0, 2.75)
+        MID_WINDOW_AT_HIGH_MAX = 4.0
+        HIGH_WINDOW_JUMP_RANGE = (0.0, 1.0)
+        HIGH_SLOPE_RANGE = (0.01, 0.12)
+        MEDIAN_FILTER_CHOICES = (1, 3)
         WATERSHED_CONNECTIVITY_CHOICES = (4,)
         return
     raise ValueError(f"Unknown search profile: {profile}")
@@ -564,6 +581,9 @@ def hyperparameter_cli(parameters: dict[str, float | int]) -> list[str]:
     for name in (
         "min_height",
         "median_filter_size",
+        "chm_pit_fill_size",
+        "chm_pit_depth",
+        "chm_gaussian_sigma",
         "lmf_low_height_limit",
         "lmf_high_height_limit",
         "lmf_low_window_size",
@@ -571,10 +591,18 @@ def hyperparameter_cli(parameters: dict[str, float | int]) -> list[str]:
         "lmf_mid_intercept",
         "lmf_high_slope",
         "lmf_high_intercept",
+        "lmf_control_height_1",
+        "lmf_control_height_2",
+        "lmf_control_height_3",
+        "lmf_control_window_0",
+        "lmf_control_window_1",
+        "lmf_control_window_2",
+        "lmf_control_window_3",
         "watershed_connectivity",
         "polygon_connectivity",
     ):
-        result.extend((f"--{name.replace('_', '-')}", str(parameters[name])))
+        if name in parameters:
+            result.extend((f"--{name.replace('_', '-')}", str(parameters[name])))
     return result
 
 
@@ -595,7 +623,9 @@ def run_logged(command: list[str], log_path: Path) -> None:
         )
 
 
-def read_metrics(summary_path: Path) -> dict[str, float]:
+def read_metrics(
+    summary_path: Path, source_by_tile: dict[str, str] | None = None
+) -> dict[str, float]:
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     flattened: dict[str, float] = {}
     for row in payload["overall_metrics"]:
@@ -615,6 +645,47 @@ def read_metrics(summary_path: Path) -> dict[str, float]:
             flattened[f"{field}@{suffix}"] = (
                 float(value) if value is not None else math.nan
             )
+    if source_by_tile is not None:
+        per_tile_path = summary_path.with_name("per_tile_metrics.csv")
+        with per_tile_path.open("r", encoding="utf-8", newline="") as stream:
+            tile_rows = list(csv.DictReader(stream))
+        missing = sorted(
+            {row["tile_id"] for row in tile_rows} - set(source_by_tile)
+        )
+        if missing:
+            raise ValueError(
+                "Missing source mapping for tiles: " + ", ".join(missing)
+            )
+        sources = sorted({source_by_tile[row["tile_id"]] for row in tile_rows})
+        pq_by_source: dict[str, float] = {}
+        for source in sources:
+            rows = [
+                row
+                for row in tile_rows
+                if source_by_tile[row["tile_id"]] == source
+            ]
+            tp = sum(int(row["true_positives"]) for row in rows)
+            fp = sum(int(row["false_positives"]) for row in rows)
+            fn = sum(int(row["false_negatives"]) for row in rows)
+            summed_iou = sum(
+                int(row["true_positives"])
+                * (
+                    float(row["segmentation_quality"])
+                    if row["segmentation_quality"]
+                    else 0.0
+                )
+                for row in rows
+            )
+            denominator = tp + 0.5 * fp + 0.5 * fn
+            pq = summed_iou / denominator if denominator else 0.0
+            flattened[f"source_pq@{source}@{PRIMARY_IOU:.2f}"] = pq
+            pq_by_source[source] = pq
+        flattened["source_balanced_pq"] = float(
+            np.mean(list(pq_by_source.values()))
+        )
+        flattened["source_balanced_pq_std"] = float(
+            np.std(list(pq_by_source.values()))
+        )
     return flattened
 
 
@@ -628,6 +699,8 @@ def objective_score(metrics: dict[str, float], objective: str) -> float:
             weight * finite_or_zero(f"panoptic_quality@{threshold:.2f}")
             for threshold, weight in OBJECTIVE_WEIGHTS.items()
         )
+    if objective == "source-balanced-pq":
+        return finite_or_zero("source_balanced_pq")
     metric_name = {
         "pq": "panoptic_quality",
         "f1": "f1",
@@ -716,7 +789,10 @@ def evaluate_candidate(
     try:
         run_logged(segmentation_command, trial_directory / "segmentation.log")
         run_logged(evaluation_command, trial_directory / "evaluation.log")
-        metrics = read_metrics(metrics_dir / "evaluation_summary.json")
+        metrics = read_metrics(
+            metrics_dir / "evaluation_summary.json",
+            getattr(args, "source_by_tile", None),
+        )
         score = objective_score(metrics, args.objective)
         if not math.isfinite(score):
             raise ValueError("Objective score is not finite")
